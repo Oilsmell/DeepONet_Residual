@@ -1,0 +1,338 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Feb 14 20:08:55 2026
+
+@author: Oilsmell
+"""
+
+# -*- coding: utf-8 -*-
+"""
+[Step 2] Scale-Invariant Residual DeepONet Training
+Location: E:\2ndstructuredata\Code_2\step2_deeponet.py
+Goal: Train DeepONet to predict 'Normalized Residuals' using Structure A data ONLY.
+Strategy:
+    - Input: Latent z (from AE) + Normalized DI (0~1)
+    - Target: Normalized Damaged - Normalized Healthy
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+import pickle
+from scipy.stats import kurtosis
+import matplotlib.pyplot as plt
+
+# =========================================================
+# 1. Configuration
+# =========================================================
+class Config:
+    # 경로 (Step 1과 동일)
+    DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
+    SAVE_DIR = r"E:\2ndstructuredata\Code_2"
+    
+    # 불러올 파일들
+    ENCODER_PATH = os.path.join(SAVE_DIR, "encoder_only.pth")
+    SCALER_A_PATH = os.path.join(SAVE_DIR, "scaler_A.pkl")
+    
+    # 저장할 모델
+    DEEPONET_PATH = os.path.join(SAVE_DIR, "deeponet_model.pth")
+    DI_SCALER_PATH = os.path.join(SAVE_DIR, "scaler_di.pkl") # DI 정규화용 저장
+    
+    # 파라미터
+    WINDOW_SIZE = 128
+    LATENT_DIM = 8
+    SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+    DAMAGE_CASES = list(range(1, 11)) # f1 ~ f10
+    
+    # 학습 파라미터
+    BATCH_SIZE = 256
+    EPOCHS = 300
+    LR = 0.001
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+cfg = Config()
+
+# =========================================================
+# 2. Model Definitions (Encoder & DeepONet)
+# =========================================================
+# (Step 1과 동일한 구조의 인코더)
+class Encoder(nn.Sequential):
+    def __init__(self, input_dim=128*8, latent_dim=8):
+        super().__init__(
+            nn.Linear(input_dim, 512), nn.Tanh(),
+            nn.Linear(512, 256), nn.Tanh(),
+            nn.Linear(256, 64), nn.Tanh(),
+            nn.Linear(64, latent_dim)
+        )
+
+# Fourier Feature for Trunk Net (고주파 학습용)
+class FourierFeature(nn.Module):
+    def __init__(self, input_dim, mapping_size=128, scale=10):
+        super().__init__()
+        self.register_buffer('B', torch.randn(input_dim, mapping_size) * scale)
+    def forward(self, x):
+        # x: (Batch, 2) -> (Batch, mapping_size)
+        projected = 2 * np.pi * (x @ self.B)
+        return torch.cat([torch.sin(projected), torch.cos(projected)], dim=-1)
+
+class DeepONet(nn.Module):
+    def __init__(self, branch_dim=9, trunk_dim=2, hidden_dim=128):
+        super().__init__()
+        # Branch: z(8) + DI(1) = 9
+        self.branch = nn.Sequential(
+            nn.Linear(branch_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        # Trunk: t(1) + x(1) = 2 -> Fourier -> 256
+        self.fourier = FourierFeature(trunk_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(256, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, branch_in, trunk_in):
+        # Branch Output: (Batch, Hidden)
+        B = self.branch(branch_in)
+        # Trunk Output: (Batch, Hidden)
+        T = self.trunk(self.fourier(trunk_in))
+        # Dot Product
+        return torch.sum(B * T, dim=-1, keepdim=True) + self.bias
+
+# =========================================================
+# 3. Data Processing Functions
+# =========================================================
+def load_and_normalize_A(filepath, scaler):
+    """데이터 로드 후 Scaler A로 0~1 정규화"""
+    try:
+        data = np.loadtxt(filepath)
+        if data.shape[0] > data.shape[1]:
+            data = data[:, cfg.SELECTED_NODES].T
+        else:
+            data = data[cfg.SELECTED_NODES, :]
+        
+        # Reshape for Scaler (N, 8*Window)
+        n_points = data.shape[1]
+        n_samples = n_points // cfg.WINDOW_SIZE
+        valid_len = n_samples * cfg.WINDOW_SIZE
+        data = data[:, :valid_len]
+        
+        # (8, N, W) -> (N, 8, W) -> (N, 8*W)
+        reshaped = data.reshape(8, n_samples, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(n_samples, -1)
+        
+        # Transform using pre-trained scaler
+        normalized = scaler.transform(reshaped)
+        return normalized, n_samples
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}")
+        return None, 0
+
+def calc_raw_di(healthy_raw, damaged_raw):
+    """
+    [수정됨] 물리적 DI 계산 (Kurtosis Diff, 95th Percentile)
+    - 전체 신호를 윈도우로 자른 뒤, 상위 5% 값(95th)을 대푯값으로 사용
+    - 노이즈나 일시적 이상치에 더 강건함
+    """
+    # DI 계산용 윈도우 크기 (약 1~2초 구간 추천, 여기선 2000 포인트로 설정)
+    calc_window = 2000 
+    
+    n_sensors, n_points = healthy_raw.shape
+    n_wins = n_points // calc_window
+    
+    if n_wins < 1: # 데이터가 너무 짧을 경우 전체를 하나로 봄
+        calc_window = n_points
+        n_wins = 1
+        
+    di_list = []
+    
+    for i in range(8): # 8개 센서 각각 계산
+        # 1. 윈도우로 자르기 (Reshape)
+        h_wins = healthy_raw[i, :n_wins*calc_window].reshape(n_wins, calc_window)
+        d_wins = damaged_raw[i, :n_wins*calc_window].reshape(n_wins, calc_window)
+        
+        # 2. 각 윈도우별 Kurtosis 계산
+        k_h = kurtosis(h_wins, axis=1, fisher=False)
+        k_d = kurtosis(d_wins, axis=1, fisher=False)
+        
+        # 3. [핵심] 95th Percentile 적용
+        # 건강 상태와 손상 상태의 '최대 변화폭' 근처를 비교
+        val_h = np.percentile(k_h, 95)
+        val_d = np.percentile(k_d, 95)
+        
+        di_list.append(abs(val_h - val_d))
+        
+    return np.mean(di_list)
+
+# =========================================================
+# 4. Main Training Logic
+# =========================================================
+def main():
+    print("[Step 2] DeepONet Training (Scale-Invariant)")
+    
+    # 1. Load Scaler & Encoder
+    with open(cfg.SCALER_A_PATH, 'rb') as f:
+        scaler_A = pickle.load(f)
+    
+    encoder = Encoder().to(cfg.device)
+    encoder.load_state_dict(torch.load(cfg.ENCODER_PATH))
+    encoder.eval() # 인코더는 학습하지 않음 (Frozen)
+    print("   -> Loaded Encoder and Scaler A.")
+
+    # 2. Prepare Data Lists
+    branch_inputs = [] # [z, DI]
+    trunk_inputs = []  # [t, x]
+    targets = []       # [Residual]
+
+    # 2-1. Load Healthy Data (Reference)
+    path_h = os.path.join(cfg.DIR_A, "fh_accelerations.dat")
+    norm_h, n_samples = load_and_normalize_A(path_h, scaler_A)
+    
+    # Healthy Raw for DI calc
+    raw_h = np.loadtxt(path_h)[:, cfg.SELECTED_NODES].T 
+    
+    # Encode Healthy Data (Get z)
+    with torch.no_grad():
+        z_tensor = encoder(torch.FloatTensor(norm_h).to(cfg.device))
+        z_np = z_tensor.cpu().numpy() # (N, 8)
+        
+    print(f"   -> Reference Healthy Data Processed ({n_samples} samples)")
+
+    # 2-2. Process Damage Cases (f1 ~ f10)
+    print("   -> Processing Damage Cases...")
+    
+    # DI 정규화를 위해 먼저 DI 값들을 수집
+    raw_di_values = []
+    damage_data_buffer = [] # (norm_d, di_raw)
+    
+    for case in cfg.DAMAGE_CASES:
+        path_d = os.path.join(cfg.DIR_A, f"f{case}_accelerations.dat")
+        raw_d = np.loadtxt(path_d)[:, cfg.SELECTED_NODES].T
+        
+        # Calculate Real DI (Raw Scale)
+        current_di = calc_raw_di(raw_h[:, :raw_d.shape[1]], raw_d)
+        raw_di_values.append(current_di)
+        
+        # Normalize Data (for Target)
+        norm_d, _ = load_and_normalize_A(path_d, scaler_A)
+        damage_data_buffer.append(norm_d)
+        
+    # [핵심] DI Normalize (0 ~ 1)
+    min_di = min(raw_di_values)
+    max_di = max(raw_di_values)
+    print(f"      DI Range: {min_di:.5f} ~ {max_di:.5f}")
+    
+    # DI 정규화 정보 저장 (나중에 B 생성때 필요)
+    di_scaler_info = {'min': min_di, 'max': max_di}
+    with open(cfg.DI_SCALER_PATH, 'wb') as f:
+        pickle.dump(di_scaler_info, f)
+        
+    # 3. Construct Training Set
+    for i, norm_d in enumerate(damage_data_buffer):
+        # Normalized DI calculation
+        raw_di = raw_di_values[i]
+        norm_di_val = (raw_di - min_di) / (max_di - min_di + 1e-8) # 0~1 Scaling
+        
+        # Target: Normalized Residual (Damaged - Healthy)
+        # norm_d와 norm_h의 길이를 맞춰야 함
+        min_len = min(len(norm_d), len(norm_h))
+        res = norm_d[:min_len] - norm_h[:min_len]
+        
+        # Inputs Construction
+        # Branch: [z (from healthy), DI]
+        # z는 healthy에서 온 것이므로 그대로 반복 사용
+        current_z = z_np[:min_len]
+        di_vec = np.full((min_len, 1), norm_di_val)
+        b_in = np.hstack([current_z, di_vec]) # (N, 9)
+        
+        # Trunk: [t, x]
+        # t: 0~1 (Normalized Time)
+        # x: 0~1 (Normalized Sensor ID)
+        # 전체 데이터 포인트에 대해 (N, 128*8)이 아니라 (N*128*8) 형태로 풀어서 학습?
+        # DeepONet 효율성을 위해 여기서는 (N_samples, 8_sensors, 128_time) 구조를 활용.
+        # 편의상: (Batch_Branch) vs (Batch_Trunk)
+        # 하지만 Residual이 (N, 1024) 형태이므로, Trunk는 고정된 좌표값 집합임.
+        
+        # 효율적인 학습을 위해 데이터를 Flatten하지 않고, 
+        # Branch(N, 9) -> Output(N, 1024) 형태로 학습 (Modified DeepONet)
+        # 즉, Trunk 입력은 고정된 (1024, 2) 좌표 행렬을 사용.
+        
+        branch_inputs.append(b_in)
+        targets.append(res)
+        
+    # Combine All Cases
+    X_branch = np.vstack(branch_inputs) # (Total_N, 9)
+    Y_target = np.vstack(targets)       # (Total_N, 1024)
+    
+    # Prepare Fixed Trunk Input (Time, Sensor)
+    # 128 Time points * 8 Sensors = 1024 points
+    t_space = np.linspace(0, 1, cfg.WINDOW_SIZE)
+    x_space = np.linspace(0, 1, 8)
+    T_grid, X_grid = np.meshgrid(t_space, x_space)
+    # (1024, 2) 좌표 행렬
+    trunk_fixed = np.stack([T_grid.flatten(), X_grid.flatten()], axis=1)
+    trunk_fixed = torch.FloatTensor(trunk_fixed).to(cfg.device)
+    
+    print(f"   -> Training Data Ready. Shape: {X_branch.shape}")
+
+    # 4. Training Loop
+    dataset = TensorDataset(torch.FloatTensor(X_branch), torch.FloatTensor(Y_target))
+    loader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE, shuffle=True)
+    
+    model = DeepONet().to(cfg.device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.LR)
+    criterion = nn.MSELoss()
+    
+    model.train()
+    loss_history = []
+    
+    for epoch in range(cfg.EPOCHS):
+        epoch_loss = 0
+        for b_in, y_true in loader:
+            b_in, y_true = b_in.to(cfg.device), y_true.to(cfg.device)
+            
+            optimizer.zero_grad()
+            
+            # Trunk 입력은 고정되어 있으므로 매번 동일하게 통과
+            # (Batch, 1024) 출력을 만들어야 함
+            # DeepONet forward 수정 필요: (Batch, Hidden) * (1024, Hidden) -> (Batch, 1024)
+            
+            # 수동 Dot Product 구현 (Broadcasting)
+            B_out = model.branch(b_in) # (Batch, Hidden)
+            T_out = model.trunk(model.fourier(trunk_fixed)) # (1024, Hidden)
+            
+            # Output = B * T^T + bias
+            pred = torch.matmul(B_out, T_out.T) + model.bias # (Batch, 1024)
+            
+            loss = criterion(pred, y_true)
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            
+        avg_loss = epoch_loss / len(loader)
+        loss_history.append(avg_loss)
+        
+        if (epoch+1) % 50 == 0:
+            print(f"   Epoch {epoch+1}/{cfg.EPOCHS} | Loss: {avg_loss:.6f}")
+            
+    # 5. Save Model
+    torch.save(model.state_dict(), cfg.DEEPONET_PATH)
+    print(f"\n✅ DeepONet Training Complete. Saved to {cfg.DEEPONET_PATH}")
+    print(f"✅ DI Scaler Info Saved (Range: {min_di:.4f} ~ {max_di:.4f})")
+    
+    # Plot Loss
+    plt.plot(loss_history)
+    plt.title("DeepONet Training Loss (Normalized Residuals)")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.savefig(os.path.join(cfg.SAVE_DIR, "deeponet_loss.png"))
+    plt.show()
+
+if __name__ == "__main__":
+    main()
